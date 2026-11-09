@@ -23,6 +23,7 @@ from .utils import bias_init_with_prob, linear_init
 __all__ = (
     "OBB",
     "Classify",
+    "ClassifyMulti",
     "Detect",
     "Pose",
     "RTDETRDecoder",
@@ -830,6 +831,58 @@ class Classify(nn.Module):
         if self.training:
             return x
         y = x.softmax(1)  # get final output
+        return y if self.export else (y, x)
+
+
+class ClassifyMulti(nn.Module):
+    """YOLO classification head for multi-label classification.
+
+    This class implements a classification head that transforms feature maps into multi-label class predictions.
+
+    Attributes:
+        export (bool): Export mode flag.
+        conv (Conv): Convolutional layer for feature transformation.
+        pool (nn.AdaptiveAvgPool2d): Global average pooling layer.
+        drop (nn.Dropout): Dropout layer for regularization.
+        linear (nn.Linear): Linear layer for final classification.
+
+    Methods:
+        forward: Perform forward pass on input feature maps.
+
+    Examples:
+        Create a multi-label classification head
+        >>> classify_multi = ClassifyMulti(c1=1024, c2=1000)
+        >>> x = torch.randn(1, 1024, 20, 20)
+        >>> output = classify_multi(x)
+    """
+    export = False  # export mode
+
+    def __init__(self, c1: int, c2: int, k: int = 1, s: int = 1, p: int | None = None, g: int = 1):
+        """Initialize YOLO multi-label classification head to transform input tensor from (b,c1,20,20) to (b,c2) shape.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output classes.
+            k (int): Kernel size.
+            s (int): Stride.
+            p (int, optional): Padding.
+            g (int): Groups.
+        """
+        super().__init__()
+        c_ = 1280  # efficientnet_b0 size
+        self.conv = Conv(c1, c_, k, s, p, g)
+        self.pool = nn.AdaptiveAvgPool2d(1)  # to x(b,c_,1,1)
+        self.drop = nn.Dropout(p=0.0, inplace=True)
+        self.linear = nn.Linear(c_, c2)  # to x(b,c2)
+
+    def forward(self, x: list[torch.Tensor] | torch.Tensor) -> torch.Tensor | tuple:
+        """Perform forward pass on input feature maps."""
+        if isinstance(x, list):
+            x = torch.cat(x, 1)
+        x = self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+        if self.training:
+            return x
+        y = x.sigmoid()  # get final output
         return y if self.export else (y, x)
 
 

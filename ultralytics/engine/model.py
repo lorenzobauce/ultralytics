@@ -770,11 +770,17 @@ class Model(torch.nn.Module):
         checks.check_pip_update_available()
 
         overrides = YAML.load(checks.check_yaml(kwargs["cfg"])) if kwargs.get("cfg") else self.overrides
+        data = (
+            (overrides.get("data") if kwargs.get("cfg") else None)
+            or kwargs.get("data")
+            or DEFAULT_CFG_DICT["data"]
+            or TASK2DATA.get(self.task)
+        )
+        if data is None:
+            raise ValueError(f"A dataset must be provided with 'data=' for task '{self.task}'.")
         custom = {
             # NOTE: handle the case when 'cfg' includes 'data'.
-            "data": (overrides.get("data") if kwargs.get("cfg") else None)
-            or DEFAULT_CFG_DICT["data"]
-            or TASK2DATA[self.task],
+            "data": data,
             "model": self.overrides["model"],
             "task": self.task,
         }  # method defaults

@@ -47,6 +47,9 @@ mask_ratio: 4 # (int) mask downsample ratio (segment only)
 # Classification
 dropout: 0.0 # (float) dropout for classification head (classify only)
 
+# Multi Label Classification
+threshold: 0.5 # (float) probability threshold for multi-label classification metrics (classifymulti only)
+
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) run validation/testing during training
 split: val # (str) dataset split to evaluate: 'val', 'test' or 'train'

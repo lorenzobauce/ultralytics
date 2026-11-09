@@ -513,10 +513,22 @@ def check_det_dataset(dataset: str, autodownload: bool = True, split: str = "") 
     data["names"] = check_class_names(data["names"])
     data["channels"] = data.get("channels", 3)  # get image channels, default to 3
 
-    # Resolve paths
-    path = Path(extract_dir or data.get("path") or Path(data.get("yaml_file", "")).parent)  # dataset root
-    if not path.exists() and not path.is_absolute():
-        path = (DATASETS_DIR / path).resolve()  # path relative to DATASETS_DIR
+    # Resolve custom dataset paths relative to their YAML, preserving built-in dataset settings.
+    yaml_dir = file.resolve().parent
+    builtin_yaml_dir = Path(__file__).resolve().parents[1] / "cfg" / "datasets"
+    if extract_dir:
+        path = Path(extract_dir)
+    elif data.get("path"):
+        path = Path(data["path"])
+        if not path.is_absolute():
+            if yaml_dir == builtin_yaml_dir:
+                if not path.exists():
+                    path = DATASETS_DIR / path
+            else:
+                path = yaml_dir / path
+    else:
+        path = yaml_dir
+    path = path.resolve()
 
     # Set paths
     data["path"] = path  # download scripts

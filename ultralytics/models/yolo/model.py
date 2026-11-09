@@ -13,6 +13,7 @@ from ultralytics.engine.model import Model
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import (
     ClassificationModel,
+    MultiLabelClassificationModel,
     DetectionModel,
     OBBModel,
     PoseModel,
@@ -93,6 +94,12 @@ class YOLO(Model):
                 "trainer": yolo.classify.ClassificationTrainer,
                 "validator": yolo.classify.ClassificationValidator,
                 "predictor": yolo.classify.ClassificationPredictor,
+            },
+            "classifymulti": {
+                "model": MultiLabelClassificationModel,
+                "trainer": yolo.classifymulti.MultiLabelClassificationTrainer,
+                "validator": yolo.classifymulti.MultiLabelClassificationValidator,
+                "predictor": yolo.classifymulti.MultiLabelClassificationPredictor,
             },
             "detect": {
                 "model": DetectionModel,

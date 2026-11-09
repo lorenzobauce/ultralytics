@@ -841,13 +841,13 @@ def plot_images(
                         label = f"{c}" if show_labels else ""
                         label += f" {conf_text}".strip() if show_conf else ""
                         annotator.box_label(box, label, color=color)
-
             elif len(classes):
-                for c in classes:
+                line_height = annotator.font.getsize("Ag")[1] + 2
+                for j, c in enumerate(classes):
                     color = colors(c)
                     c = names.get(c, c) if names else c
                     label = f"{c}" if labels else f"{c} {conf[0]:.1f}"
-                    annotator.text([x, y], label, txt_color=color, box_color=(64, 64, 64, 128))
+                    annotator.text([x+5,y+5+j*line_height], label, txt_color=color, box_color=(64, 64, 64, 128))
 
             # Plot keypoints
             if len(kpts):
@@ -948,8 +948,11 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
                 columns = (
                     loss_keys[:loss_mid] + metric_keys[:metric_mid] + loss_keys[loss_mid:] + metric_keys[metric_mid:]
                 )
-                fig, ax = plt.subplots(2, len(columns) // 2, figsize=(len(columns) + 2, 6), tight_layout=True)
+                ncols = max(1, (len(columns) + 1) // 2)
+                fig, ax = plt.subplots(2, ncols, figsize=(len(columns) + 2, 6), tight_layout=True)
                 ax = ax.ravel()
+                for unused_ax in ax[len(columns) :]:
+                    unused_ax.set_visible(False)
             x = data.select(data.columns[0]).to_numpy().flatten()
             for i, j in enumerate(columns):
                 y = data.select(j).to_numpy().flatten().astype("float")
@@ -959,10 +962,11 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
         except Exception as e:
             LOGGER.error(f"Plotting error for {f}: {e}")
     if ax is not None:
-        ax[1].legend()
+        if columns:
+            ax[min(1, len(columns) - 1)].legend()
         fname = save_dir / "results.png"
         fig.savefig(fname, dpi=200)
-        plt.close()
+        plt.close(fig)
         if on_plot:
             on_plot(fname)
 

@@ -34,6 +34,7 @@ from .base import BaseDataset
 from .converter import merge_multi_segment
 from .utils import (
     HELP_URL,
+    IMG_FORMATS,
     check_file_speeds,
     get_hash,
     img2label_paths,
@@ -1139,6 +1140,257 @@ class ClassificationDataset:
             if msgs:
                 LOGGER.info("\n".join(msgs))
             x["hash"] = get_hash([x[0] for x in self.samples])
+            x["results"] = nf, nc, len(samples), samples
+            x["msgs"] = msgs  # warnings
+            save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
+            return samples
+
+
+class MultiLabelClassificationDataset:
+    """Dataset for multi-label classification using YOLO-style image and text-label pairs.
+
+    Attributes:
+        cache_ram (bool): Indicates if caching in RAM is enabled.
+        cache_disk (bool): Indicates if caching on disk is enabled.
+        samples (list): Image paths, multi-hot labels, optional cache paths, and cached image arrays.
+        torch_transforms (callable): PyTorch transforms to be applied to the images.
+        root (str): Image directory or text manifest containing image paths.
+        data_root (Path | str | None): Dataset root used to resolve relative paths in a manifest.
+        nc (int): Number of classes.
+        prefix (str): Prefix for logging and cache filenames.
+        img_cache (np.ndarray): Contiguous uint8 buffer holding all cached images when caching in RAM.
+        img_offsets (np.ndarray): Flat offset of each image within img_cache.
+        img_shapes (list): (h, w, c) shape of each cached image.
+
+    Methods:
+        __getitem__: Return a transformed image and multi-hot class vector.
+        __len__: Return the total number of samples in the dataset.
+        verify_images: Verify all images in dataset.
+        cache_images: Decode all images once into a single contiguous RAM buffer.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        args,
+        nc: int,
+        augment: bool = False,
+        prefix: str = "",
+        data_root: Path | str | None = None,
+    ):
+        """Initialize a YOLO multi-label classification dataset.
+
+        Args:
+            root (str): Path to an image split directory or a .txt manifest with one image path per line.
+            args (Namespace): Configuration containing dataset-related settings such as image size, augmentation
+                parameters, and cache settings.
+            nc (int): Number of classes defined by the dataset configuration.
+            augment (bool, optional): Whether to apply augmentations to the dataset.
+            prefix (str, optional): Prefix for logging and cache filenames.
+            data_root (Path | str, optional): Base directory for relative paths in a manifest. Defaults to the
+                manifest's parent directory.
+        """
+        root_path = Path(root).resolve()
+        if not root_path.exists():
+            raise FileNotFoundError(f"Dataset source '{root_path}' does not exist.")
+        if nc < 1:
+            raise ValueError(f"Number of classes must be positive, got {nc}.")
+        if args.single_cls:
+            raise ValueError("'single_cls' is not supported for multi-label classification.")
+
+        self.root = str(root_path)
+        self.nc = nc
+        if root_path.is_dir():
+            image_files = sorted(
+                str(path.resolve()) for path in root_path.rglob("*.*") if path.suffix[1:].lower() in IMG_FORMATS
+            )
+        elif root_path.is_file() and root_path.suffix.lower() == ".txt":
+            image_files = []
+            manifest_root = Path(data_root).expanduser().resolve() if data_root is not None else root_path.parent
+            for line_number, line in enumerate(root_path.read_text(encoding="utf-8-sig").splitlines(), start=1):
+                entry = line.strip()
+                if not entry:
+                    continue
+                image_path = Path(entry).expanduser()
+                if not image_path.is_absolute():
+                    image_path = manifest_root / image_path
+                image_path = image_path.resolve()
+                if image_path.suffix[1:].lower() not in IMG_FORMATS:
+                    raise ValueError(
+                        f"{root_path}:{line_number}: '{entry}' is not a supported image path (got {image_path.suffix})."
+                    )
+                if not image_path.is_file():
+                    raise FileNotFoundError(f"{root_path}:{line_number}: image '{image_path}' does not exist.")
+                image_files.append(str(image_path))
+            if len(image_files) != len(set(image_files)):
+                raise ValueError(f"Image manifest '{root_path}' contains duplicate image paths.")
+            image_files.sort()
+        else:
+            raise FileNotFoundError(
+                f"Dataset source '{root_path}' must be an image directory or a .txt image manifest."
+            )
+        if not image_files:
+            raise FileNotFoundError(f"No images found in dataset source '{self.root}'.")
+
+        label_files = img2label_paths(image_files)
+        missing_labels = [path for path in label_files if not Path(path).is_file()]
+        if missing_labels:
+            examples = ", ".join(missing_labels[:5])
+            raise FileNotFoundError(
+                f"Missing {len(missing_labels)} label files for images in '{self.root}'. "
+                f"Create an empty .txt for images with no positive labels. Examples: {examples}"
+            )
+        self.samples = [
+            (image_file, self._read_labels(label_file)) for image_file, label_file in zip(image_files, label_files)
+        ]
+
+        if augment and args.fraction < 1.0:  # reduce training fraction
+            self.samples = self.samples[: round(len(self.samples) * args.fraction)]
+        self.prefix = colorstr(f"{prefix}: ") if prefix else ""
+        self.cache_ram = args.cache is True or str(args.cache).lower() == "ram"  # cache images into RAM
+        self.cache_disk = str(args.cache).lower() == "disk"  # cache images on hard drive as uncompressed *.npy files
+        self.samples = self.verify_images()  # filter out bad images
+        if not self.samples:
+            raise ValueError(f"No samples found in '{self.root}' after applying the dataset fraction.")
+        self.samples = [[*sample, Path(sample[0]).with_suffix(".npy"), None] for sample in self.samples]
+        if self.cache_ram:
+            self.cache_images()
+        scale = (1.0 - args.scale, 1.0)  # (0.08, 1.0)
+        self.torch_transforms = (
+            classify_augmentations(
+                size=args.imgsz,
+                scale=scale,
+                hflip=args.fliplr,
+                vflip=args.flipud,
+                erasing=args.erasing,
+                auto_augment=args.auto_augment,
+                hsv_h=args.hsv_h,
+                hsv_s=args.hsv_s,
+                hsv_v=args.hsv_v,
+            )
+            if augment
+            else classify_transforms(size=args.imgsz)
+        )
+
+    def _read_labels(self, label_file: str) -> np.ndarray:
+        """Read one class ID per line and return a float32 multi-hot vector."""
+        label = np.zeros(self.nc, dtype=np.float32)
+        class_ids = set()
+        for line_number, line in enumerate(Path(label_file).read_text(encoding="utf-8").splitlines(), start=1):
+            fields = line.split()
+            if not fields:
+                continue
+            if len(fields) != 1:
+                raise ValueError(f"{label_file}:{line_number}: expected one class ID per line.")
+            try:
+                class_id = int(fields[0])
+            except ValueError as e:
+                raise ValueError(f"{label_file}:{line_number}: class ID must be an integer.") from e
+            if not 0 <= class_id < self.nc:
+                raise ValueError(
+                    f"{label_file}:{line_number}: class ID {class_id} is outside the valid range [0, {self.nc - 1}]."
+                )
+            class_ids.add(class_id)
+        if class_ids:
+            label[list(class_ids)] = 1.0
+        return label
+
+    def __getitem__(self, i: int) -> dict:
+        """Return a transformed image and its multi-hot class vector.
+
+        Args:
+            i (int): Index of the sample to retrieve.
+
+        Returns:
+            (dict): Dictionary containing the image tensor and float32 multi-hot labels.
+        """
+        f, cls, fn, im = self.samples[i]  # filename, labels, filename.with_suffix('.npy'), image
+        if self.cache_ram:
+            h, w, c = self.img_shapes[i]
+            pos = self.img_offsets[i]
+            im = self.img_cache[pos : pos + h * w * c].reshape(h, w, c)  # zero-copy view
+        elif self.cache_disk:
+            if not fn.exists():  # load npy
+                np.save(fn.as_posix(), cv2.imread(f), allow_pickle=False)
+            im = np.load(fn)
+        else:  # read image
+            im = cv2.imread(f)  # BGR
+        im = Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))
+        sample = self.torch_transforms(im)
+        return {"img": sample, "cls": torch.from_numpy(cls.copy())}
+
+    def __len__(self) -> int:
+        """Return the total number of samples in the dataset."""
+        return len(self.samples)
+
+    def cache_images(self) -> None:
+        """Decode all images once into a single contiguous uint8 buffer before DataLoader workers fork.
+
+        A Python list of per-image arrays is duplicated into every forked worker by copy-on-write refcounting
+        (https://github.com/ultralytics/ultralytics/issues/9824); one shared numpy buffer is read-only across
+        workers instead, so RAM stays flat. Original image sizes are preserved for the transforms.
+        """
+        with ThreadPool(NUM_THREADS) as pool:
+            ims = list(
+                TQDM(
+                    pool.imap(lambda s: cv2.imread(s[0]), self.samples),
+                    total=len(self.samples),
+                    desc=f"{self.prefix}Caching images",
+                    disable=LOCAL_RANK > 0,
+                )
+            )
+        self.img_shapes = [im.shape for im in ims]
+        self.img_offsets = np.cumsum([0] + [im.size for im in ims[:-1]])
+        self.img_cache = np.concatenate([im.reshape(-1) for im in ims])
+
+    def verify_images(self) -> list[tuple]:
+        """Verify all images in dataset.
+
+        Returns:
+            (list[tuple]): List of valid samples after verification.
+        """
+        desc = f"{self.prefix}Scanning {self.root}..."
+        root_path = Path(self.root)
+        path = (
+            root_path.with_suffix(".classifymulti.cache")
+            if root_path.is_file()
+            else root_path.with_name(f"{root_path.name}.classifymulti.cache")
+        )
+        image_files = [sample[0] for sample in self.samples]
+        cache_hash = get_hash(image_files + img2label_paths(image_files))
+
+        try:
+            check_file_speeds(image_files[:5], prefix=self.prefix)
+            cache = load_dataset_cache_file(path)  # attempt to load a *.cache file
+            assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
+            assert cache["hash"] == cache_hash  # images and labels are unchanged
+            nf, nc, n, samples = cache.pop("results")  # found, corrupt, total, samples
+            if LOCAL_RANK in {-1, 0}:
+                d = f"{desc} {nf} images, {nc} corrupt"
+                TQDM(None, desc=d, total=n, initial=n)
+                if cache["msgs"]:
+                    LOGGER.info("\n".join(cache["msgs"]))  # display warnings
+            return samples
+
+        # NOTE: ModuleNotFoundError to prevent numpy version conflicts when loading cache files created with different numpy versions
+        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+            # Run scan if *.cache retrieval failed
+            nf, nc, msgs, samples, x = 0, 0, [], [], {}
+            with ThreadPool(NUM_THREADS) as pool:
+                results = pool.imap(func=verify_image, iterable=zip(self.samples, repeat(self.prefix)))
+                pbar = TQDM(results, desc=desc, total=len(self.samples))
+                for sample, nf_f, nc_f, msg in pbar:
+                    if nf_f:
+                        samples.append(sample)
+                    if msg:
+                        msgs.append(msg)
+                    nf += nf_f
+                    nc += nc_f
+                    pbar.desc = f"{desc} {nf} images, {nc} corrupt"
+                pbar.close()
+            if msgs:
+                LOGGER.info("\n".join(msgs))
+            x["hash"] = cache_hash
             x["results"] = nf, nc, len(samples), samples
             x["msgs"] = msgs  # warnings
             save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
